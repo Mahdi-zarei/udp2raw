@@ -30,6 +30,9 @@ extern int ifindex;
 extern char g_packet_buf[huge_buf_len];
 extern int g_packet_buf_len;
 extern int g_packet_buf_cnt;
+extern int raw_recv_batch;  // how many packets recvmmsg drains per syscall (also the per-epoll-event drain cap)
+extern int raw_send_batch;  // how many raw packets sendmmsg coalesces per flush
+extern int send_flush_max_us;  // max time (us) a packet may sit in the send batch before being flushed
 #ifdef UDP2RAW_MP
 extern queue_t my_queue;
 
@@ -276,6 +279,9 @@ int client_bind_to_a_new_port2(int &fd, const address_t &address);
 
 int discard_raw_packet();
 int pre_recv_raw_packet();
+
+int flush_raw_send();        // send everything queued in the raw send batch now (no-op in the MP build)
+int maybe_flush_raw_send();  // flush the raw send batch only if it is full or has aged past send_flush_max_us
 
 int send_raw_ip(raw_info_t &raw_info, const char *payload, int payloadlen);
 

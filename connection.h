@@ -309,5 +309,9 @@ int send_data_safer(conn_info_t &conn_info, const char *data, int len, u32_t con
 
 // int recv_safer(conn_info_t &conn_info,char &type,char* &data,int &len);///safer transfer function with anti-replay,when mutually verification is done.
 
-int recv_safer_multi(conn_info_t &conn_info, vector<char> &type_arr, vector<string> &data_arr);  // new api for handle gro
+// callback-based recv that replaces recv_safer_multi: delivers each recovered (gro-split) sub-packet to cb
+// immediately, with no per-packet heap allocation. data points into a reused static buffer and is only valid
+// during the cb call. returns the number of sub-packets delivered (0 means nothing decoded -> treat as failure).
+typedef void (*recv_safer_cb_t)(void *ctx, char type, char *data, int len);
+int recv_safer_each(conn_info_t &conn_info, recv_safer_cb_t cb, void *ctx);  // new api for handle gro
 #endif                                                                                           /* CONNECTION_H_ */

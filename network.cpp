@@ -10,9 +10,13 @@
 #include "misc.h"
 
 int g_fix_gro = 0;
+int g_verify_recv_csum = 0;  // recv-side TCP checksum is never enforced (only logged); off by default to save a per-packet csum. --verify-recv-csum re-enables the computation.
 
 int raw_recv_fd = -1;
 int raw_send_fd = -1;
+int raw_recv_batch = 32;           // packets drained per epoll wakeup (recvmmsg); defined unconditionally so the MP build links, only used by the UDP2RAW_LINUX recv path
+int raw_send_batch = 32;           // raw packets coalesced per sendmmsg flush (also defined unconditionally for the MP link)
+int send_flush_max_us = 500;       // hard cap on how long a packet may wait in the send batch, in microseconds
 u32_t link_level_header_len = 0;  // set it to 14 if SOCK_RAW is used in socket(PF_PACKET, SOCK_RAW, htons(ETH_P_IP));
 int use_tcp_dummy_socket = 0;
 
@@ -50,12 +54,42 @@ int g_packet_buf_len = -1;
 int g_packet_buf_cnt = 0;
 
 #ifdef UDP2RAW_LINUX
+union sockaddr_union_t {
+    sockaddr_ll ll;
+    sockaddr_in ipv4;
+    sockaddr_in6 ipv6;
+};
 union {
     sockaddr_ll ll;
     sockaddr_in ipv4;
     sockaddr_in6 ipv6;
 } g_sockaddr;
 socklen_t g_sockaddr_len = -1;
+
+// ---- recvmmsg batch state for raw_recv_fd ----
+// One recvmmsg() drains up to raw_recv_batch packets into g_recv_batch_buf[]; pre_recv_raw_packet() then hands
+// them out one at a time (copied into g_packet_buf) so every existing single-packet parser stays untouched.
+// (raw_recv_batch itself is defined unconditionally near the top of this file so the MP build links too.)
+const int raw_recv_batch_max = 64;
+static char g_recv_batch_buf[raw_recv_batch_max][huge_buf_len];
+static struct mmsghdr g_recv_batch_hdr[raw_recv_batch_max];
+static struct iovec g_recv_batch_iov[raw_recv_batch_max];
+static sockaddr_union_t g_recv_batch_addr[raw_recv_batch_max];
+static int g_recv_batch_count = 0;  // packets returned by the last recvmmsg
+static int g_recv_batch_idx = 0;    // next slot to hand out
+static int g_recv_batch_inited = 0;
+
+// ---- sendmmsg batch state for raw_send_fd ----
+// send_raw_packet() copies each built packet here instead of calling sendto immediately; the batch is flushed
+// with one sendmmsg when it fills (raw_send_batch), ages past send_flush_max_us, or the event loop is about to
+// block. This collapses the per-packet sendto on the single raw_send_fd into one syscall per batch.
+const int raw_send_batch_max = 64;
+static char g_send_batch_buf[raw_send_batch_max][buf_len];
+static struct mmsghdr g_send_batch_hdr[raw_send_batch_max];
+static struct iovec g_send_batch_iov[raw_send_batch_max];
+static sockaddr_union_t g_send_batch_addr[raw_send_batch_max];
+static int g_send_batch_count = 0;       // packets queued, not yet sent
+static u64_t g_send_batch_first_us = 0;  // when the current batch's first packet was queued
 #endif
 
 #ifdef UDP2RAW_MP
@@ -1061,46 +1095,89 @@ int find_lower_level_info(u32_t ip, u32_t &dest_ip, string &if_name, string &hw)
 #endif
 
 #ifdef UDP2RAW_LINUX
+// send everything queued in the batch with a single sendmmsg. raw sends are fire-and-forget: a failed or short
+// send drops those packets, exactly like the old per-packet sendto failure path (the tunneled protocol retransmits).
+int flush_raw_send() {
+    if (g_send_batch_count == 0) return 0;
+    int n = g_send_batch_count;
+    g_send_batch_count = 0;  // reset first so this is safe even if re-entered
+    int sent = sendmmsg(raw_send_fd, g_send_batch_hdr, n, 0);
+    if (sent < 0) {
+        mylog(log_trace, "sendmmsg failed, %s\n", strerror(errno));
+        return -1;
+    }
+    if (sent < n) {
+        mylog(log_trace, "sendmmsg sent %d of %d\n", sent, n);
+    }
+    return 0;
+}
+// flush only when the batch is full or has waited too long; cheap to call often (no-op when empty).
+int maybe_flush_raw_send() {
+    if (g_send_batch_count == 0) return 0;
+    if (g_send_batch_count >= raw_send_batch ||
+        get_current_time_us() - g_send_batch_first_us >= (u64_t)send_flush_max_us) {
+        return flush_raw_send();
+    }
+    return 0;
+}
 int send_raw_packet(raw_info_t &raw_info, const char *packet, int len) {
     const packet_info_t &send_info = raw_info.send_info;
     const packet_info_t &recv_info = raw_info.recv_info;
 
-    int ret;
+    if (len > buf_len) {  // packets are always built in buf_len buffers; guard just keeps the slot memcpy safe
+        mylog(log_warn, "raw packet len %d > buf_len %d, dropped\n", len, buf_len);
+        return -1;
+    }
+    if (g_send_batch_count >= raw_send_batch_max) flush_raw_send();  // never overflow the slot array
+
+    int slot = g_send_batch_count;
+
+    socklen_t addrlen;
     if (lower_level == 0) {
         if (raw_ip_version == AF_INET) {
-            struct sockaddr_in sin = {0};
-            sin.sin_family = raw_ip_version;
-            // sin.sin_port = htons(info.dst_port); //dont need this
-            sin.sin_addr.s_addr = send_info.new_dst_ip.v4;
-            ret = sendto(raw_send_fd, packet, len, 0, (struct sockaddr *)&sin, sizeof(sin));
+            sockaddr_in *sin = &g_send_batch_addr[slot].ipv4;
+            memset(sin, 0, sizeof(*sin));
+            sin->sin_family = raw_ip_version;
+            sin->sin_addr.s_addr = send_info.new_dst_ip.v4;
+            addrlen = sizeof(*sin);
         } else if (raw_ip_version == AF_INET6) {
-            struct sockaddr_in6 sin = {0};
-            sin.sin6_family = raw_ip_version;
-            // sin.sin_port = htons(info.dst_port); //dont need this
-            sin.sin6_addr = send_info.new_dst_ip.v6;
-            ret = sendto(raw_send_fd, packet, len, 0, (struct sockaddr *)&sin, sizeof(sin));
+            sockaddr_in6 *sin = &g_send_batch_addr[slot].ipv6;
+            memset(sin, 0, sizeof(*sin));
+            sin->sin6_family = raw_ip_version;
+            sin->sin6_addr = send_info.new_dst_ip.v6;
+            addrlen = sizeof(*sin);
         } else {
             assert(0 == 1);
+            return -1;
         }
-
     } else {
-        struct sockaddr_ll addr = {0};  //={0} not necessary
-        memcpy(&addr, &send_info.addr_ll, sizeof(addr));
+        sockaddr_ll *addr = &g_send_batch_addr[slot].ll;
+        memcpy(addr, &send_info.addr_ll, sizeof(*addr));
+        addrlen = sizeof(*addr);
+    }
 
-        ret = sendto(raw_send_fd, packet, len, 0, (struct sockaddr *)&addr, sizeof(addr));
-    }
-    if (ret == -1) {
-        mylog(log_trace, "sendto failed\n");
-        // perror("why?");
-        return -1;
-    } else {
-        // mylog(log_info,"sendto succ\n");
-    }
+    memcpy(g_send_batch_buf[slot], packet, len);  // copy out: the caller's packet buffer is reused after we return
+    g_send_batch_iov[slot].iov_base = g_send_batch_buf[slot];
+    g_send_batch_iov[slot].iov_len = len;
+    memset(&g_send_batch_hdr[slot].msg_hdr, 0, sizeof(g_send_batch_hdr[slot].msg_hdr));
+    g_send_batch_hdr[slot].msg_hdr.msg_name = &g_send_batch_addr[slot];
+    g_send_batch_hdr[slot].msg_hdr.msg_namelen = addrlen;
+    g_send_batch_hdr[slot].msg_hdr.msg_iov = &g_send_batch_iov[slot];
+    g_send_batch_hdr[slot].msg_hdr.msg_iovlen = 1;
+
+    if (g_send_batch_count == 0) g_send_batch_first_us = get_current_time_us();
+    g_send_batch_count++;
+
+    maybe_flush_raw_send();
     return 0;
 }
 #endif
 
 #ifdef UDP2RAW_MP
+
+// the multi-platform build sends each packet immediately (libnet/pcap), so batching is a no-op here.
+int flush_raw_send() { return 0; }
+int maybe_flush_raw_send() { return 0; }
 
 int send_raw_packet(raw_info_t &raw_info, const char *packet, int len) {
     const packet_info_t &send_info = raw_info.send_info;
@@ -1241,16 +1318,54 @@ int send_raw_ip(raw_info_t &raw_info, const char *payload, int payloadlen) {
     return send_raw_packet(raw_info, send_raw_ip_buf, ip_tot_len);
 }
 
+#ifdef UDP2RAW_LINUX
+static void recv_batch_init_once() {
+    if (g_recv_batch_inited) return;
+    for (int i = 0; i < raw_recv_batch_max; i++) {
+        g_recv_batch_iov[i].iov_base = g_recv_batch_buf[i];
+        g_recv_batch_iov[i].iov_len = huge_data_len + 1;
+        memset(&g_recv_batch_hdr[i], 0, sizeof(g_recv_batch_hdr[i]));
+        g_recv_batch_hdr[i].msg_hdr.msg_iov = &g_recv_batch_iov[i];
+        g_recv_batch_hdr[i].msg_hdr.msg_iovlen = 1;
+        g_recv_batch_hdr[i].msg_hdr.msg_name = &g_recv_batch_addr[i];
+        g_recv_batch_hdr[i].msg_hdr.msg_namelen = sizeof(g_recv_batch_addr[i]);
+    }
+    g_recv_batch_inited = 1;
+}
+#endif
+
+// hands out one packet (into g_packet_buf) per call, refilling the batch with a single recvmmsg when drained.
+// returns 0 on a ready packet, -1 on a dropped/oversize packet (caller should keep draining), -2 when the
+// socket is empty (caller should stop the drain loop). the -2 sentinel is what the event-loop drain loops break on.
 int pre_recv_raw_packet() {
 #ifdef UDP2RAW_LINUX
     assert(g_packet_buf_cnt == 0);
 
-    g_sockaddr_len = sizeof(g_sockaddr.ll);
-    g_packet_buf_len = recvfrom(raw_recv_fd, g_packet_buf, huge_data_len + 1, 0, (sockaddr *)&g_sockaddr, &g_sockaddr_len);
-    // assert(g_sockaddr_len==sizeof(g_sockaddr.ll)); //g_sockaddr_len=18, sizeof(g_sockaddr.ll)=20, why its not equal? maybe its bc sll_halen is 6?
+    recv_batch_init_once();
 
-    // assert(g_addr_ll_size==sizeof(g_addr_ll));
+    if (g_recv_batch_idx >= g_recv_batch_count) {
+        int batch = raw_recv_batch;
+        if (batch > raw_recv_batch_max) batch = raw_recv_batch_max;
+        if (batch < 1) batch = 1;
+        for (int i = 0; i < batch; i++) {
+            g_recv_batch_hdr[i].msg_hdr.msg_namelen = sizeof(g_recv_batch_addr[i]);  // recvmmsg overwrites this per msg
+            g_recv_batch_hdr[i].msg_len = 0;
+        }
+        int n = recvmmsg(raw_recv_fd, g_recv_batch_hdr, batch, MSG_DONTWAIT, 0);
+        if (n <= 0) {
+            g_recv_batch_count = 0;
+            g_recv_batch_idx = 0;
+            return -2;  // EAGAIN / nothing left -> stop draining
+        }
+        g_recv_batch_count = n;
+        g_recv_batch_idx = 0;
+    }
 
+    int slot = g_recv_batch_idx++;
+    g_packet_buf_len = (int)g_recv_batch_hdr[slot].msg_len;
+
+    // mirror the size validation the old single recvfrom() did. iov_len is huge_data_len+1, so a packet that big
+    // or larger reports msg_len==huge_data_len+1 (with MSG_TRUNC) exactly like the old recvfrom() return.
     if (g_packet_buf_len == huge_data_len + 1) {
         if (g_fix_gro == 0) {
             mylog(log_warn, "huge packet, data_len %d > %d,dropped\n", g_packet_buf_len, huge_data_len);
@@ -1277,6 +1392,12 @@ int pre_recv_raw_packet() {
         mylog(log_trace, "recv_len %d\n", g_packet_buf_len);
         return -1;
     }
+
+    // hand the slot to the existing parsers via g_packet_buf / g_sockaddr
+    memcpy(g_packet_buf, g_recv_batch_buf[slot], g_packet_buf_len);
+    memcpy(&g_sockaddr, &g_recv_batch_addr[slot], sizeof(g_sockaddr.ll));
+    g_sockaddr_len = g_recv_batch_hdr[slot].msg_hdr.msg_namelen;
+
     g_packet_buf_cnt++;
 #endif
     return 0;
@@ -1616,6 +1737,18 @@ int send_raw_udp(raw_info_t &raw_info, const char *payload, int payloadlen) {
     return 0;
 }
 
+// fast non-cryptographic prng (xorshift64) used only for the tcp-window jitter below. that jitter is
+// anti-fingerprinting, not security sensitive, so we avoid a /dev/urandom read syscall on every sent packet.
+static u64_t g_fast_rng_state = 0;
+static inline u32_t fast_rand_u32() {
+    u64_t x = g_fast_rng_state;
+    if (x == 0) x = get_true_random_number_64() | 1ull;  // seed once from real entropy, keep nonzero
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    g_fast_rng_state = x;
+    return (u32_t)(x >> 32);
+}
 int send_raw_tcp(raw_info_t &raw_info, const char *payload, int payloadlen) {  // TODO seq increase
 
     const packet_info_t &send_info = raw_info.send_info;
@@ -1707,7 +1840,7 @@ int send_raw_tcp(raw_info_t &raw_info, const char *payload, int payloadlen) {  /
 
     tcph->urg = 0;
     // tcph->window = htons((uint16_t)(1024));
-    tcph->window = htons((uint16_t)(receive_window_lower_bound + get_true_random_number() % receive_window_random_range));
+    tcph->window = htons((uint16_t)(receive_window_lower_bound + fast_rand_u32() % receive_window_random_range));
 
     tcph->check = 0;  // leave checksum 0 now, filled later by pseudo header
     tcph->urg_ptr = 0;
@@ -2202,43 +2335,43 @@ int recv_raw_tcp(raw_info_t &raw_info, char *&payload, int &payloadlen) {
     }
 
     // memcpy(recv_raw_tcp_buf+ sizeof(struct pseudo_header) , ip_payload , ip_payloadlen);
-    uint16_t tcp_chk;
-    int csum_len = ip_payloadlen;
-    if (raw_ip_version == AF_INET) {
-        pseudo_header tmp_header;
-        struct pseudo_header *psh = &tmp_header;
+    // The recv-side TCP checksum is informational only: the failure branch below never drops (the encryption
+    // layer + anti-replay already guarantee integrity), so by default we skip this full-payload csum to save
+    // CPU on every inbound packet. Re-enable the (still non-dropping) computation with --verify-recv-csum.
+    if (g_verify_recv_csum) {
+        uint16_t tcp_chk;
+        int csum_len = ip_payloadlen;
+        if (raw_ip_version == AF_INET) {
+            pseudo_header tmp_header;
+            struct pseudo_header *psh = &tmp_header;
 
-        psh->source_address = recv_info.new_src_ip.v4;
-        psh->dest_address = recv_info.new_dst_ip.v4;
-        psh->placeholder = 0;
-        psh->protocol = IPPROTO_TCP;
-        psh->tcp_length = htons(ip_payloadlen);
+            psh->source_address = recv_info.new_src_ip.v4;
+            psh->dest_address = recv_info.new_dst_ip.v4;
+            psh->placeholder = 0;
+            psh->protocol = IPPROTO_TCP;
+            psh->tcp_length = htons(ip_payloadlen);
 
-        tcp_chk = csum_with_header((char *)psh, sizeof(pseudo_header), (unsigned short *)ip_payload, csum_len);
-    } else {
-        assert(raw_ip_version == AF_INET6);
+            tcp_chk = csum_with_header((char *)psh, sizeof(pseudo_header), (unsigned short *)ip_payload, csum_len);
+        } else {
+            assert(raw_ip_version == AF_INET6);
 
-        pseudo_header6 tmp_header;
-        struct pseudo_header6 *psh = &tmp_header;
+            pseudo_header6 tmp_header;
+            struct pseudo_header6 *psh = &tmp_header;
 
-        psh->src = recv_info.new_src_ip.v6;
-        psh->dst = recv_info.new_dst_ip.v6;
-        psh->placeholder1 = 0;
-        psh->placeholder2 = 0;
-        psh->next_header = IPPROTO_TCP;
-        psh->tcp_length = htons(ip_payloadlen);
+            psh->src = recv_info.new_src_ip.v6;
+            psh->dst = recv_info.new_dst_ip.v6;
+            psh->placeholder1 = 0;
+            psh->placeholder2 = 0;
+            psh->next_header = IPPROTO_TCP;
+            psh->tcp_length = htons(ip_payloadlen);
 
-        tcp_chk = csum_with_header((char *)psh, sizeof(pseudo_header6), (unsigned short *)ip_payload, csum_len);
-    }
-    /*for(int i=0;i<csum_len;i++)
-    {
-        printf("<%d>",int(ip_payload[i]));
-    }
-    printf("\n");*/
+            tcp_chk = csum_with_header((char *)psh, sizeof(pseudo_header6), (unsigned short *)ip_payload, csum_len);
+        }
 
-    if (tcp_chk != 0) {
-        mylog(log_debug, "tcp_chk:%x, tcp checksum failed, ignored\n", tcp_chk);
-        // return -1;
+        if (tcp_chk != 0) {
+            mylog(log_debug, "tcp_chk:%x, tcp checksum failed, ignored\n", tcp_chk);
+            // return -1;
+        }
     }
 
     char *tcp_begin = ip_payload;  // ip packet's data part

@@ -148,6 +148,10 @@ void print_help() {
     printf("    --disable-anti-replay                 disable anti-replay,not suggested\n");
     printf("    --fix-gro                             try to fix huge packet caused by GRO. this option is at an early stage.\n");
     printf("                                          make sure client and server are at same version.\n");
+    printf("    --recv-batch         <number>        max raw packets drained per epoll wakeup via recvmmsg, default:32. higher=fewer syscalls at high pps\n");
+    printf("    --verify-recv-csum                   compute the recv-side tcp checksum (off by default; it is informational only and never enforced)\n");
+    printf("    --send-batch         <number>        max raw packets coalesced per sendmmsg, default:32 (max 64)\n");
+    printf("    --send-flush-us      <number>        max microseconds a packet waits in the send batch before flush, default:500\n");
 
     // printf("\n");
     printf("client options:\n");
@@ -296,6 +300,10 @@ void process_arg(int argc, char *argv[])  // process all options
             {"no-pcap-mutex", no_argument, 0, 1},
 #endif
             {"fix-gro", no_argument, 0, 1},
+            {"recv-batch", required_argument, 0, 1},
+            {"verify-recv-csum", no_argument, 0, 1},
+            {"send-batch", required_argument, 0, 1},
+            {"send-flush-us", required_argument, 0, 1},
             {NULL, 0, 0, 0}};
 
     process_log_level(argc, argv);
@@ -677,6 +685,23 @@ void process_arg(int argc, char *argv[])  // process all options
                 } else if (strcmp(long_options[option_index].name, "fix-gro") == 0) {
                     mylog(log_info, "--fix-gro enabled\n");
                     g_fix_gro = 1;
+                } else if (strcmp(long_options[option_index].name, "recv-batch") == 0) {
+                    sscanf(optarg, "%d", &raw_recv_batch);
+                    if (raw_recv_batch < 1) raw_recv_batch = 1;
+                    if (raw_recv_batch > 1024) raw_recv_batch = 1024;  // upper bound on packets drained per epoll wakeup
+                    mylog(log_info, "raw_recv_batch=%d\n", raw_recv_batch);
+                } else if (strcmp(long_options[option_index].name, "verify-recv-csum") == 0) {
+                    g_verify_recv_csum = 1;
+                    mylog(log_info, "--verify-recv-csum enabled (recv-side tcp checksum will be computed; note it is still not enforced)\n");
+                } else if (strcmp(long_options[option_index].name, "send-batch") == 0) {
+                    sscanf(optarg, "%d", &raw_send_batch);
+                    if (raw_send_batch < 1) raw_send_batch = 1;
+                    if (raw_send_batch > 64) raw_send_batch = 64;  // internal sendmmsg slot array is 64 deep
+                    mylog(log_info, "raw_send_batch=%d\n", raw_send_batch);
+                } else if (strcmp(long_options[option_index].name, "send-flush-us") == 0) {
+                    sscanf(optarg, "%d", &send_flush_max_us);
+                    if (send_flush_max_us < 0) send_flush_max_us = 0;
+                    mylog(log_info, "send_flush_max_us=%d\n", send_flush_max_us);
                 } else {
                     mylog(log_warn, "ignored unknown long option ,option_index:%d code:<%x>\n", option_index, optopt);
                 }

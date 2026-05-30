@@ -369,6 +369,10 @@ int client_on_raw_recv_hs2_or_ready(conn_info_t &conn_info, char type, char *dat
     }
     return 0;
 }
+// callback for recv_safer_each() in the handshake2/ready path (replaces the old per-packet vector<string>)
+static void client_hs2_ready_cb(void *p, char type, char *data, int data_len) {
+    client_on_raw_recv_hs2_or_ready(*(conn_info_t *)p, type, data, data_len);
+}
 int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a packet.
 {
     char *data;
@@ -381,7 +385,11 @@ int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a
     mylog(log_trace, "<client_on_raw_recv,send_info.ts_ack= %u>\n", send_info.ts_ack);
 
 #ifdef UDP2RAW_LINUX
-    if (pre_recv_raw_packet() < 0) return -1;
+    {
+        int pre_ret = pre_recv_raw_packet();
+        if (pre_ret == -2) return -2;  // batch/socket drained -> tells raw_recv_cb's drain loop to stop
+        if (pre_ret < 0) return -1;
+    }
 #endif
 
     if (conn_info.state.client_current_state == client_idle) {
@@ -476,19 +484,9 @@ int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a
         return 0;
     } else if (conn_info.state.client_current_state == client_handshake2 || conn_info.state.client_current_state == client_ready)  // received heartbeat or data
     {
-        vector<char> type_vec;
-        vector<string> data_vec;
-        recv_safer_multi(conn_info, type_vec, data_vec);
-        if (data_vec.empty()) {
+        if (recv_safer_each(conn_info, client_hs2_ready_cb, &conn_info) == 0) {
             mylog(log_debug, "recv_safer failed!\n");
             return -1;
-        }
-
-        for (int i = 0; i < (int)type_vec.size(); i++) {
-            char type = type_vec[i];
-            char *data = (char *)data_vec[i].c_str();  // be careful, do not append data to it
-            int data_len = data_vec[i].length();
-            client_on_raw_recv_hs2_or_ready(conn_info, type, data, data_len);
         }
 
         return 0;
@@ -505,8 +503,9 @@ int client_on_udp_recv(conn_info_t &conn_info) {
     socklen_t udp_new_addr_len = sizeof(address_t::storage_t);
     if ((recv_len = recvfrom(udp_fd, buf, max_data_len + 1, 0,
                              (struct sockaddr *)&udp_new_addr_in, &udp_new_addr_len)) == -1) {
+        // EAGAIN on the non-blocking udp_fd -> nothing left, tells the drain loop to stop
         mylog(log_debug, "recv_from error,%s\n", get_sock_error());
-        return -1;
+        return -2;
         // myexit(1);
     };
 
@@ -544,13 +543,26 @@ int client_on_udp_recv(conn_info_t &conn_info) {
 }
 void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     conn_info_t &conn_info = *((conn_info_t *)watcher->data);
-    client_on_udp_recv(conn_info);
+    // drain the local udp_fd in a burst (all local streams funnel here; fd is non-blocking, -2 == EAGAIN/empty)
+    for (int b = 0; b < raw_recv_batch; b++) {
+        if (client_on_udp_recv(conn_info) == -2) break;
+    }
 }
 void raw_recv_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     if (is_udp2raw_mp) assert(0 == 1);
     conn_info_t &conn_info = *((conn_info_t *)watcher->data);
-    client_on_raw_recv(conn_info);
+    // drain up to one recvmmsg batch per libev wakeup (level-triggered, so leftovers re-fire next loop).
+    for (int b = 0; b < raw_recv_batch; b++) {
+        if (client_on_raw_recv(conn_info) == -2) break;
+    }
 }
+#ifdef UDP2RAW_LINUX
+// runs right before libev blocks: flush any raw packets still queued in the send batch so they never wait
+// longer than one loop iteration (the per-packet timer in send_raw_packet caps it tighter during bursts).
+void send_flush_prepare_cb(struct ev_loop *loop, struct ev_prepare *watcher, int revents) {
+    flush_raw_send();
+}
+#endif
 #ifdef UDP2RAW_MP
 void async_cb(struct ev_loop *loop, struct ev_async *watcher, int revents) {
     conn_info_t &conn_info = *((conn_info_t *)watcher->data);
@@ -889,6 +901,12 @@ int client_event_loop() {
 
         mylog(log_info, "fifo_file=%s\n", fifo_file);
     }
+
+#ifdef UDP2RAW_LINUX
+    struct ev_prepare send_flush_watcher;
+    ev_prepare_init(&send_flush_watcher, send_flush_prepare_cb);
+    ev_prepare_start(loop, &send_flush_watcher);
+#endif
 
     ev_run(loop, 0);
     return 0;

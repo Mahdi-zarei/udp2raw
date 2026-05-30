@@ -549,30 +549,28 @@ int recv_safer_notused(conn_info_t &conn_info, char &type, char *&data, int &len
     return reserved_parse_safer(conn_info, recv_data, recv_len, type, data, len);
 }
 
-int recv_safer_multi(conn_info_t &conn_info, vector<char> &type_arr, vector<string> &data_arr)  /// safer transfer function with anti-replay,when mutually verification is done.
+int recv_safer_each(conn_info_t &conn_info, recv_safer_cb_t cb, void *ctx)  /// safer transfer function with anti-replay,when mutually verification is done.
 {
     packet_info_t &send_info = conn_info.raw_info.send_info;
     packet_info_t &recv_info = conn_info.raw_info.recv_info;
 
     char *recv_data;
     int recv_len;
-    assert(type_arr.empty());
-    assert(data_arr.empty());
 
-    if (recv_raw0(conn_info.raw_info, recv_data, recv_len) != 0) return -1;
+    if (recv_raw0(conn_info.raw_info, recv_data, recv_len) != 0) return 0;
 
     char type;
     char *data;
     int len;
+    int delivered = 0;  // number of sub-packets handed to cb; data is only valid during each cb() call
 
     if (g_fix_gro == 0) {
         int ret = reserved_parse_safer(conn_info, recv_data, recv_len, type, data, len);
         if (ret == 0) {
-            type_arr.push_back(type);
-            data_arr.emplace_back(data, data + len);
-            // std::copy(data,data+len,data_arr[0]);
+            cb(ctx, type, data, len);
+            delivered++;
         }
-        return 0;
+        return delivered;
     } else {
         char *ori_recv_data = recv_data;
         int ori_recv_len = recv_len;
@@ -606,17 +604,16 @@ int recv_safer_multi(conn_info_t &conn_info, vector<char> &type_arr, vector<stri
             if (ret != 0) {
                 mylog(log_debug, "parse failed, offset= %d,single_len=%d(%d)\n", (int)(recv_data - ori_recv_data), single_len, single_len_no_xor);
             } else {
-                type_arr.push_back(type);
-                data_arr.emplace_back(data, data + len);
-                // std::copy(data,data+len,data_arr[data_arr.size()-1]);
+                cb(ctx, type, data, len);  // deliver immediately; recv_data_buf is reused on the next iteration
+                delivered++;
             }
             recv_data += single_len;
             recv_len -= single_len;
         }
         if (cnt > 1) {
-            mylog(log_debug, "got a suspected gro packet, %d packets recovered, recv_len=%d, loop_cnt=%d\n", (int)data_arr.size(), ori_recv_len, cnt);
+            mylog(log_debug, "got a suspected gro packet, %d packets recovered, recv_len=%d, loop_cnt=%d\n", delivered, ori_recv_len, cnt);
         }
-        return 0;
+        return delivered;
     }
 }
 

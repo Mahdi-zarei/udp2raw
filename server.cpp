@@ -377,6 +377,15 @@ int server_on_raw_recv_handshake1(conn_info_t &conn_info, char *ip_port, char *d
 int server_on_recv_safer_multi(conn_info_t &conn_info, char type, char *data, int data_len) {
     return 0;
 }
+// context + callback for recv_safer_each() in the server_ready hot path (replaces the old per-packet vector<string>)
+struct server_ready_cb_ctx_t {
+    conn_info_t *conn_info;
+    char *ip_port;
+};
+static void server_ready_cb(void *p, char type, char *data, int data_len) {
+    server_ready_cb_ctx_t *c = (server_ready_cb_ctx_t *)p;
+    server_on_raw_recv_ready(*c->conn_info, c->ip_port, type, data, data_len);
+}
 int server_on_raw_recv_multi()  // called when server received an raw packet
 {
     char dummy_buf[buf_len];
@@ -384,7 +393,11 @@ int server_on_raw_recv_multi()  // called when server received an raw packet
     peek_raw_info.peek = 1;
     packet_info_t &peek_info = peek_raw_info.recv_info;
     mylog(log_trace, "got a packet\n");
-    if (pre_recv_raw_packet() < 0) return -1;
+    {
+        int pre_ret = pre_recv_raw_packet();
+        if (pre_ret == -2) return -2;  // batch/socket drained -> tells the drain loop to stop
+        if (pre_ret < 0) return -1;    // dropped packet -> drain loop continues to next one
+    }
     if (peek_raw(peek_raw_info) < 0) {
         discard_raw_packet();
         // recv(raw_recv_fd, 0,0, 0  );//
@@ -533,19 +546,10 @@ int server_on_raw_recv_multi()  // called when server received an raw packet
         return server_on_raw_recv_handshake1(conn_info, ip_port, data, data_len);
     }
     if (conn_info.state.server_current_state == server_ready) {
-        vector<char> type_vec;
-        vector<string> data_vec;
-        recv_safer_multi(conn_info, type_vec, data_vec);
-        if (data_vec.empty()) {
+        server_ready_cb_ctx_t cb_ctx{&conn_info, ip_port};
+        if (recv_safer_each(conn_info, server_ready_cb, &cb_ctx) == 0) {
             mylog(log_debug, "recv_safer failed!\n");
             return -1;
-        }
-
-        for (int i = 0; i < (int)type_vec.size(); i++) {
-            char type = type_vec[i];
-            char *data = (char *)data_vec[i].c_str();  // be careful, do not append data to it
-            int data_len = data_vec[i].length();
-            server_on_raw_recv_ready(conn_info, ip_port, type, data, data_len);
         }
         return 0;
     }
@@ -587,8 +591,9 @@ int server_on_udp_recv(conn_info_t &conn_info, fd64_t fd64) {
     }
 
     if (recv_len < 0) {
-        mylog(log_debug, "udp fd,recv_len<0 continue,%s\n", strerror(errno));
-        return -1;
+        // EAGAIN on the non-blocking udp_fd -> nothing left, tells the drain loop to stop
+        mylog(log_debug, "udp fd,recv_len<0,%s\n", strerror(errno));
+        return -2;
     }
 
     if (recv_len >= mtu_warn) {
@@ -710,6 +715,8 @@ int server_event_loop() {
     {
         if (about_to_exit) myexit(0);
 
+        flush_raw_send();  // flush any raw packets queued while processing the previous wakeup, before we block
+
         int nfds = epoll_wait(epollfd, events, max_events, 180 * 1000);
         if (nfds < 0) {  // allow zero
             if (errno == EINTR) {
@@ -741,7 +748,11 @@ int server_event_loop() {
 
             } else if (events[idx].data.u64 == (u64_t)raw_recv_fd) {
                 if (debug_flag) begin_time = get_current_time();
-                server_on_raw_recv_multi();
+                // drain up to one recvmmsg batch per epoll wakeup; epoll is level-triggered so anything left over
+                // is re-reported on the next loop, which keeps the udp_fds/timer fair under a raw-side flood.
+                for (int b = 0; b < raw_recv_batch; b++) {
+                    if (server_on_raw_recv_multi() == -2) break;
+                }
                 if (debug_flag) {
                     end_time = get_current_time();
                     mylog(log_debug, "raw_recv_fd,%llu,%llu,%llu  \n", begin_time, end_time, end_time - begin_time);
@@ -782,7 +793,10 @@ int server_event_loop() {
                 } else  // udp_fd64
                 {
                     if (debug_flag) begin_time = get_current_time();
-                    server_on_udp_recv(conn_info, fd64);
+                    // drain this conv's return traffic in a burst (fd is non-blocking; -2 == EAGAIN/empty)
+                    for (int b = 0; b < raw_recv_batch; b++) {
+                        if (server_on_udp_recv(conn_info, fd64) == -2) break;
+                    }
                     if (debug_flag) {
                         end_time = get_current_time();
                         mylog(log_debug, "(events[idx].data.u64 >>32u) == 1u,%lld,%lld,%lld  \n", begin_time, end_time, end_time - begin_time);
@@ -792,6 +806,7 @@ int server_event_loop() {
                 mylog(log_fatal, "unknown fd,this should never happen\n");
                 myexit(-1);
             }
+            maybe_flush_raw_send();  // bound how long queued raw packets wait, even within a busy wakeup
         }
     }
     return 0;

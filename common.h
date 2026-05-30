@@ -8,6 +8,9 @@
 #ifndef UDP2RAW_COMMON_H_
 #define UDP2RAW_COMMON_H_
 #define __STDC_FORMAT_MACROS 1
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE  // needed for recvmmsg()/sendmmsg()/struct mmsghdr (batched raw socket I/O); the native linux make targets dont pass -D_GNU_SOURCE
+#endif
 #include <inttypes.h>
 
 #include <stdio.h>
@@ -162,6 +165,7 @@ const int max_addr_len = 100;
 extern int force_socket_buf;
 
 extern int g_fix_gro;
+extern int g_verify_recv_csum;
 
 /*
 struct ip_port_t
@@ -377,6 +381,7 @@ struct queue_t {
 int init_ws();
 #endif
 u64_t get_current_time();
+u64_t get_current_time_us();
 u64_t pack_u64(u32_t a, u32_t b);
 
 u32_t get_u64_h(u64_t a);
